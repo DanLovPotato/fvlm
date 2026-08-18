@@ -33,6 +33,9 @@ import torch.nn.functional as F
 @torch.no_grad()
 def all_gather(data):
     """
+    all_gather is the operation that collects those separate per-GPU results and hands every GPU a copy of everyone's results, 
+    so they all end up with the same full combined set.
+
     Run all_gather on arbitrary picklable data (not necessarily tensors)
     Args:
         data: any picklable object
@@ -114,12 +117,16 @@ class BlipPretrain(BlipBase, SharedQueueMixin, MomentumDistilationMixin):
         self.query_tokens = nn.Parameter(torch.zeros(len(self.organs), vision_width))
 
     def _rampup_factor(self, epoch, iters, num_iters_per_epoch):
+        # for loss function
         return min(1, (epoch * num_iters_per_epoch + iters) / (2 * num_iters_per_epoch))
 
     def forward(self, samples):
         image = samples["image"]
         seg = samples["seg"]
 
+        #This block figures out, for each patient in the batch, which organs are fully contained inside the (randomly-cropped) CT volume versus cut off at the crop's edge '
+        #'— because training uses random crops of the full CT scan, '
+        #'and if a crop slices through the middle of, say, the heart, you don't want to compute a "heart" feature from only half a heart.
         with torch.no_grad():
             organ_mask_flags = torch.zeros(len(seg), len(self.organs), dtype=bool, device=seg.device)
             for i, pul_seg in enumerate(seg):
@@ -145,11 +152,17 @@ class BlipPretrain(BlipBase, SharedQueueMixin, MomentumDistilationMixin):
         organ_captions = samples["text_input"]
         organ_abnormal_flags = samples["organ_abnormal_flags"]
         
-        # image embeddings and features
+        # image embeddings and features 
+        # ViT runs HERE
         image_embeds, hidden_image_embeds = self.visual_encoder(image)
 
         B, L, C = image_embeds.size()
-        
+        #B = Batch size — how many patients are in this training step (e.g. 8).
+        #L = Length — the sequence length, i.e. number of tokens/patches. As traced last turn, that's 1232 (=7×16×11 patches from chopping the (112,256,352) volume into (16,16,32) chunks).
+        #C = Channels — the embedding dimension per token, i.e. vision_width = 768 (line 96).
+
+
+        # the one that happens after the random crop, using the segmentation mask to figure out which ViT tokens belong to which organ
         with torch.no_grad():
             organ_token_flags = torch.zeros(B, len(self.organs), L, dtype=bool).to(image.device)
             for i in range(B):
@@ -160,6 +173,9 @@ class BlipPretrain(BlipBase, SharedQueueMixin, MomentumDistilationMixin):
                 masks = torch.stack(
                     [torch.eq(seg[i], organ_id + 1) for organ_id in inds], dim=0).float()
 
+
+                # maxpool to shrink the voxel-level mask down to token-level — but specifically max (not average) to get a clean boolean, 
+                # and specifically at a window size matching the patch size so the result aligns token-for-token with the ViT's output.
                 downsampled_masks = F.max_pool3d(
                     masks.unsqueeze(1),
                     kernel_size=(16, 16, 32),
@@ -174,6 +190,8 @@ class BlipPretrain(BlipBase, SharedQueueMixin, MomentumDistilationMixin):
             self.temp.clamp_(0.001, 0.5)
 
         # criteria to calculate loss
+
+        # This code decides which organs are worth computing loss for in this training step
         with torch.no_grad():
             organ_status_world = (organ_abnormal_flags & organ_mask_flags).sum(0)
             if is_dist_avail_and_initialized():
@@ -213,11 +231,12 @@ class BlipPretrain(BlipBase, SharedQueueMixin, MomentumDistilationMixin):
                     return_tensors="pt",
                 ).to(image.device)
 
+                # run through full BERT stack
                 text_output = self.text_encoder.forward_text(text)
                 text_embeds = text_output.last_hidden_state
                 text_feat = F.normalize(self.text_proj(text_embeds[:, 0, :]), dim=-1)
 
-            # NOTE: gather image and text feats
+            # NOTE: gather image and text feats from everyt GPU
             if is_dist_avail_and_initialized():
                 image_feat_all = [feat.to(image_feat.device) for feat in all_gather(image_feat)]
                 text_feat_all = [feat.to(text_feat.device) for feat in all_gather(text_feat)]
@@ -303,6 +322,12 @@ class BlipPretrain(BlipBase, SharedQueueMixin, MomentumDistilationMixin):
     #     return roi_feats
 
     def get_roi_features(self, hidden_image_embeds, organ_token_flags, cl_patient_ids, cl_organ_id):
+        # before this function, you only have (a) raw ViT token embeddings for the whole scan, 
+        # and (b) a separate boolean mask saying which tokens belong to which organ. 
+        # This function (get_roi_features) is the first and only place those two things actually get merged 
+        # — via ms_image_embed[patient_id, tokens] indexing 
+        # — into "just the organ's tokens." Everything before it (organ_mask_flags, organ_token_flags) was bookkeeping to compute that mask; this is where the mask gets applied.
+
         query = self.query_tokens[cl_organ_id].unsqueeze(0).unsqueeze(0)
 
         roi_feats = []
@@ -327,6 +352,8 @@ class BlipPretrain(BlipBase, SharedQueueMixin, MomentumDistilationMixin):
         # set from_pretrained=True to load weights for 'bert-base-chinese'
         # image_encoder = ResNetEncoder.from_config(cfg, from_pretrained=True)
 
+        import os
+
         import torch
         from lavis.models.blip_models.vit import ViT
 
@@ -338,31 +365,45 @@ class BlipPretrain(BlipBase, SharedQueueMixin, MomentumDistilationMixin):
             dropout_rate=0.1,
             qkv_bias=True
         )
-        
-        ckpt = torch.load(
-            '/storage/guoruizhe/cache/hub/datasets--ibrahimhamamci--CT-RATE/code/mae_pretrain_vit_base.pth',
-            map_location='cpu'
+
+        # MAE-pretrained ViT init, used when pretraining from scratch. Path is
+        # cfg-overridable (mae_ckpt_path) and skipped entirely if missing/unset, so
+        # callers that immediately load a different, already-fVLM-pretrained
+        # checkpoint (e.g. a fine-tuning script) don't need this file at all - its
+        # output would just be overwritten by that checkpoint moments later anyway.
+        # Default path/behavior for existing pretraining configs is unchanged.
+        mae_ckpt_path = cfg.get(
+            "mae_ckpt_path",
+            '/storage/guoruizhe/cache/hub/datasets--ibrahimhamamci--CT-RATE/code/mae_pretrain_vit_base.pth'
         )
+        if mae_ckpt_path and os.path.isfile(mae_ckpt_path):
+            ckpt = torch.load(mae_ckpt_path, map_location='cpu')
 
-        from collections import OrderedDict
-        new_ckpt = OrderedDict()
-        for key, value in ckpt['model'].items():
-            if key.startswith("decoder") or key == 'mask_token' or key == "cls_token" or key.startswith("patch_embed"):
-                continue
-            
-            if key.startswith("pos_embed"):
-                value = value[0, 1:].reshape(1, 14, 14, -1).permute(0, 3, 1, 2)
-                value = F.interpolate(value, size=(16, 11), mode='bilinear', align_corners=False)
-                value = value.unsqueeze(2).repeat(1, 1, 7, 1, 1).flatten(2).permute(0, 2, 1)
-                new_ckpt['patch_embedding.position_embeddings'] = value
-                continue
+            from collections import OrderedDict
+            new_ckpt = OrderedDict()
+            for key, value in ckpt['model'].items():
+                if key.startswith("decoder") or key == 'mask_token' or key == "cls_token" or key.startswith("patch_embed"):
+                    continue
 
-            new_ckpt[key.replace('fc', 'linear').replace('proj', 'out_proj')] = value
-        model.load_state_dict(new_ckpt, strict=False)
+                if key.startswith("pos_embed"):
+                    value = value[0, 1:].reshape(1, 14, 14, -1).permute(0, 3, 1, 2)
+                    value = F.interpolate(value, size=(16, 11), mode='bilinear', align_corners=False)
+                    value = value.unsqueeze(2).repeat(1, 1, 7, 1, 1).flatten(2).permute(0, 2, 1)
+                    new_ckpt['patch_embedding.position_embeddings'] = value
+                    continue
+
+                new_ckpt[key.replace('fc', 'linear').replace('proj', 'out_proj')] = value
+            model.load_state_dict(new_ckpt, strict=False)
 
         image_encoder = model
 
-        text_encoder = XBertEncoder.from_config(cfg, from_pretrained=True)
+        # from_pretrained is cfg-overridable (text_encoder_from_pretrained) for the
+        # same reason as mae_ckpt_path above: a caller that's about to load its own
+        # full checkpoint doesn't need XBertEncoder's from_config() to first fetch
+        # BiomedVLP-CXR-BERT-specialized's HF weights, only its BertConfig (still
+        # read from med_config_path either way). Default is unchanged.
+        text_encoder_from_pretrained = cfg.get("text_encoder_from_pretrained", True)
+        text_encoder = XBertEncoder.from_config(cfg, from_pretrained=text_encoder_from_pretrained)
         text_decoder = None
 
         alpha = cfg.get("alpha", 0.4)
@@ -393,6 +434,7 @@ class BlipPretrain(BlipBase, SharedQueueMixin, MomentumDistilationMixin):
                     1.0 - self.momentum
                 )
 
+    # this is for evaluation
     @torch.inference_mode()
     def forward_test_win(
         self, 
@@ -493,7 +535,10 @@ class BlipPretrain(BlipBase, SharedQueueMixin, MomentumDistilationMixin):
     
         return organ_logits
 
+    # this is for evaluation
     def prepare_text_feat(self, test_items, length=None):
+        # test-time code path, it precomputes text embeddings once, up front, so they can be reused for every patient scan during evaluation
+        # It builds text_feat_dict from these 16 fixed sentence-pairs one time. Then every single patient in the dataset, inside the loop, reuses that same text_feat_dict
         if length is None:
             length = self.max_txt_len
 
@@ -514,7 +559,13 @@ class BlipPretrain(BlipBase, SharedQueueMixin, MomentumDistilationMixin):
             text_feat_dict[tuple(item)] = text_feat
 
         return text_feat_dict
-    
+
+    # this is for evaluation
+    # Write out both possible sentences: "lung shows no nodule." and "lung shows a nodule."
+    # Encode both through BERT → get two text embeddings, text_feat[0] (negative) and text_feat[1] (positive).
+    # Take the patient's actual lung image embedding, image_feat.
+    # Compute cosine similarity between the image and both candidate sentences: image_feat @ text_feat.t() → 2 numbers, "how much does this image look like sentence A" vs "how much does it look like sentence B".
+    # Softmax those two numbers into a probability — whichever sentence the image is more similar to wins.
     @staticmethod
     def _get_prompt(
         test_items,

@@ -1,0 +1,34 @@
+# Fine-tuning config for finetune.py. Edit values here instead of passing CLI flags.
+#
+# epochs/batch_size/num_workers/lr/min_lr/warmup_lr/warmup_steps/weight_decay/log_freq
+# mirror lavis/projects/blip/train/pretrain_ct.yaml (the original CT pretraining run
+# the released checkpoint came from), so fine-tuning on the full dataset uses the same
+# optimization schedule.
+
+# Physical GPU ids to train on - just run `python3 finetune.py`, it re-execs itself
+# under torchrun on these GPUs automatically. batch_size above is per-GPU, so the
+# effective batch size is batch_size * len(gpus).
+gpus: [0, 1]
+
+checkpoint: /mnt/researchdrive/ptiwari9/Staff_Trainee_Folders/Dan/chestCT/weights/fvlm_weights/model.pth
+output_dir: /mnt/researchdrive/ptiwari9/Staff_Trainee_Folders/Dan/chestCT/weights/fvlm_weights/finetuned
+
+epochs: 50
+batch_size: 14  # per-GPU
+num_workers: 16
+
+lr: 0.0001
+min_lr: 0.000001
+warmup_lr: 0.000001  # LR the warmup ramp starts from
+warmup_steps: 377
+weight_decay: 0.05
+
+log_freq: 1
+max_samples:  # null = use the full dataset; set an int to smoke-test on a subset
+seed: 42
+
+dist_url: env://  # torchrun fills in RANK/WORLD_SIZE/LOCAL_RANK; leave as-is
+
+wandb_project: fvlm-finetune
+wandb_run_name:  # null = wandb auto-generates one
+wandb_mode: online  # "disabled" to turn off W&B entirely without touching code
