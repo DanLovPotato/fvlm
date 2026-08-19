@@ -73,7 +73,6 @@ FROZEN_ORGANS = ("esophagus", "heart", "lung")
 CROP_SIZE = (112, 256, 352)   # (D, H, W) - matches the checkpoint's fixed 1232-token position embedding
 PATCH_SIZE = (16, 16, 32)
 
-
 def count_intact_organs(seg, organs):
     """Per sample in the batch, which organs actually survive the random crop intact.
 
