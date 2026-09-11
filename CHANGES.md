@@ -10,7 +10,7 @@
 ---
 
 ## 1. 器官级微调主流程
-
+(这些是我们自己写的)
 | 文件 | 作用 |
 |---|---|
 | [preprocess.py](preprocess.py) | 离线预处理：把原始 CT 体数据按器官 mask 的包围盒裁剪、重采样、pad 到固定尺寸后存盘。逻辑核心跟原仓库 `data/preprocess.py` 一致，但前端改成读这批数据实际的目录结构（每个器官一个单独的 mask 文件，需要先合并成一张整数分割图）。`finetune.py` 训练时只读这一步的输出，不直接读原始体数据。 |
@@ -18,9 +18,7 @@
 | [finetune.yaml](finetune.yaml) | `finetune.py` 用的训练配置（超参数等）。 |
 | [eval_finetune.py](eval_finetune.py) | 针对微调后 10 器官 checkpoint 的零样本病理分类评估，从原仓库 `eval.py` 改写而来（没有直接改 `eval.py`，因为那是官方 4 器官版本的参考代码）。跟原版 `eval.py` 的三点区别：器官-id 映射方式、模型构建方式（要扩展到 10 器官）、评估用的 pathology 列表。 |
 | [compare_retrieval_Rk.py](compare_retrieval_Rk.py) | 在验证集上对比"原始未微调 checkpoint" vs "微调后 checkpoint"的图文检索指标（R@1/R@5/R@10），按器官分别统计，包括原始 checkpoint 完全没见过的 6 个新器官（预期只有接近随机水平，作为微调效果的基线）。 |
-| [_graph/eval_original_frozen_auc.py](_graph/eval_original_frozen_auc.py) | 一致性检查脚本：验证 `eval_finetune.py` 对冻结器官（lung/heart/esophagus）算出来的 AUC，是否跟"完全不做任何改动、用原始 4 器官 checkpoint 原生结构"跑出来的 AUC 一致——用来确认扩展器官这一步真的没有动到冻结器官的权重。 |
-| [_graph/plot_eval_finetune_trends.py](_graph/plot_eval_finetune_trends.py) | 读 `eval_finetune.py` 每个 epoch 的日志输出，画出每个器官每种病理随训练轮数变化的 AUC 曲线图（每个器官一个子图）。 |
-| [_graph/eval_finetune_trends.png](_graph/eval_finetune_trends.png) | 上面那个画图脚本跑出来的结果图（产物，不是代码）。 |
+
 
 ## 2. 知识增强检索流程 v1（按病人建库，`KE_prepare/`）
 
@@ -57,12 +55,4 @@ repo 里绝大部分 `lavis/` 下的文件虽然 `git diff` 显示改动很大�
 | [lavis/models/med.py](lavis/models/med.py) | `XBertEncoder` 相关改动（`set_output_embeddings` 补丁等），`KE_prepare*/compute_text_embeddings.py` 里 `_apply_environment_patches()` 依赖的就是这里的改动。 |
 | [eval.py](eval.py) | 改了验证集图像目录的读取方式（从写死的相对路径 `data/processed_valid_images` 改成拼 `finetune.py` 里的 `DATA_ROOT`），并加了 `_apply_environment_patches()` 调用。 |
 
-## 5. 其它（非代码本身，环境/产物文件）
 
-| 路径 | 说明 |
-|---|---|
-| `BiomedVLP-CXR-BERT-specialized/`、`lavis/BiomedVLP-CXR-BERT-specialized/` | 从 HuggingFace 下载的文本 encoder 配置/词表文件，不是我写的代码，是运行依赖。 |
-| `rate_res/model.csv` | 一份评估结果 csv（病人 × 各器官病理项的预测概率）。 |
-| `.vscode/` | 本地 VSCode 调试/编辑器配置，跟代码逻辑无关。 |
-| `.claude/` | Claude Code 会话留下的设置文件和生成的图表，跟代码逻辑无关。 |
-| `.gitignore` | 新增，忽略 `__pycache__/`、`*.pyc`、`wandb/`。 |
