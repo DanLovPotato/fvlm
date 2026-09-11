@@ -105,7 +105,12 @@ class BlipPretrain(BlipBase, SharedQueueMixin, MomentumDistilationMixin):
         self.organs = [
             'lung', 'heart', 'esophagus', 'aorta'
         ]
-        
+        # seg value to read for each organ in self.organs (see finetune.py's
+        # ORGAN_MASK_ID / expand_organs) - plain index+1 by default, matching every seg
+        # value being its own distinct organ. expand_organs() overwrites this when an
+        # organ needs to share another organ's seg value (e.g. "pleura" reusing "lung"'s).
+        self.organ_mask_ids = list(range(1, len(self.organs) + 1))
+
         self.attention = nn.MultiheadAttention(
             embed_dim=vision_width,
             num_heads=4,
@@ -140,14 +145,15 @@ class BlipPretrain(BlipBase, SharedQueueMixin, MomentumDistilationMixin):
                 boundary_values = torch.cat(non_zero_boundaries)
                 boundary_organs = torch.unique(boundary_values)
 
-                organ_ids, organ_counts = torch.unique(pul_seg, return_counts=True)
-                organ_ids = organ_ids[organ_ids > 0]
-                
-                # remove incomplete organs caused by random crop.
-                intact_organ_ids = [organ_id for organ_id in organ_ids if organ_id not in boundary_organs]
-                intact_organ_ids = torch.tensor(intact_organ_ids).long()
-                    
-                organ_mask_flags[i][intact_organ_ids - 1] = True
+                present_ids = torch.unique(pul_seg)
+                present_ids = set(present_ids[present_ids > 0].tolist())
+                boundary_ids = set(boundary_organs.tolist())
+                intact_ids = present_ids - boundary_ids
+
+                # organ_id here is looked up by seg value (self.organ_mask_ids), not by
+                # position - two organs (e.g. "pleura"/"lung") can share the same value.
+                for organ_id in range(len(self.organs)):
+                    organ_mask_flags[i][organ_id] = self.organ_mask_ids[organ_id] in intact_ids
 
         organ_captions = samples["text_input"]
         organ_abnormal_flags = samples["organ_abnormal_flags"]
@@ -171,7 +177,7 @@ class BlipPretrain(BlipBase, SharedQueueMixin, MomentumDistilationMixin):
                     continue
                 
                 masks = torch.stack(
-                    [torch.eq(seg[i], organ_id + 1) for organ_id in inds], dim=0).float()
+                    [torch.eq(seg[i], self.organ_mask_ids[organ_id]) for organ_id in inds], dim=0).float()
 
 
                 # maxpool to shrink the voxel-level mask down to token-level — but specifically max (not average) to get a clean boolean, 
@@ -453,63 +459,84 @@ class BlipPretrain(BlipBase, SharedQueueMixin, MomentumDistilationMixin):
         B, L, C = image_embeds.size()
 
         margin = 2
-        
+
         # remove channel dimension
         masks = masks.squeeze(1)
-            
+
+        # seg value -> every organ index in self.organs that reads that value. Usually
+        # one-to-one, but two organs can share a value (e.g. "pleura" reusing "lung"'s -
+        # see finetune.py's ORGAN_MASK_ID), so a single seg value can map to several
+        # organ ids here.
+        value_to_organ_ids = {}
+        for organ_id, mask_value in enumerate(self.organ_mask_ids):
+            value_to_organ_ids.setdefault(mask_value, []).append(organ_id)
+
+        skip_value = self.organ_mask_ids[skip_organ] if skip_organ is not None else None
+
         # for i, (embed, mask) in enumerate(zip(image_embeds, masks)):
         for i, mask in enumerate(masks):
             boundaries = []
             for d in range(mask.dim()):
                 start_slice = [slice(None)] * mask.dim()
                 end_slice = [slice(None)] * mask.dim()
-                
+
                 start_slice[d] = slice(None, margin)
                 end_slice[d] = slice(-margin, None)
-                
+
                 boundaries.append(mask[tuple(start_slice)][mask[tuple(start_slice)] > 0])
                 boundaries.append(mask[tuple(end_slice)][mask[tuple(end_slice)] > 0])
             boundaries = torch.cat(boundaries)
-            
+
             boundary_values = boundaries[boundaries > 0].flatten()
             boundary_organs = torch.unique(boundary_values)
 
-            if skip_organ is not None:
-                boundary_organs = boundary_organs[boundary_organs != skip_organ + 1]
-            
-            organ_ids, organ_counts = torch.unique(mask, return_counts=True)
-            organ_ids = organ_ids.long()
-            organ_counts = organ_counts[organ_ids != 0]
-            organ_ids = organ_ids[organ_ids != 0]
+            if skip_value is not None:
+                boundary_organs = boundary_organs[boundary_organs != skip_value]
 
-            # organs not touch boundary
-            intact_organ_ids = [organ_id for organ_id, organ_count in zip(organ_ids, organ_counts) if organ_id not in boundary_organs]
-            intact_organ_ids = torch.tensor(intact_organ_ids, device=masks.device).long()
-            intact_organ_ids = intact_organ_ids - 1
-            
-            if not len(intact_organ_ids):
+            mask_values, value_counts = torch.unique(mask, return_counts=True)
+            mask_values = mask_values.long()
+            value_counts = value_counts[mask_values != 0]
+            mask_values = mask_values[mask_values != 0]
+
+            # seg values not touching the boundary (intact, not sliced by the crop)
+            intact_values = [v for v in mask_values if v not in boundary_organs]
+
+            if not len(intact_values):
                 continue
 
-            organ_sizes = dict(zip([self.organs[organ_id] for organ_id in intact_organ_ids], [organ_counts[organ_ids == organ_id + 1].item() for organ_id in intact_organ_ids]))
+            value_counts_map = {v.item(): c.item() for v, c in zip(mask_values, value_counts)}
 
+            # every organ whose seg value is intact, by organ id - a value shared by
+            # several organs (lung/pleura) gives every one of them the same voxel count.
+            intact_organ_ids = [
+                organ_id for v in intact_values for organ_id in value_to_organ_ids.get(v.item(), [])
+            ]
+            organ_sizes = {
+                self.organs[oid]: value_counts_map[self.organ_mask_ids[oid]] for oid in intact_organ_ids
+            }
+
+            excluded_organ_ids = set()
             for k, v in organ_sizes.items():
                 if k in whole_organ_sizes and v / whole_organ_sizes[k] != 1:
                     print(f'Mask id: {i}', f'Rank: {dist.get_rank() if dist.is_initialized() else 0}', 'Incomplete', k, v / whole_organ_sizes[k])
                     if v / whole_organ_sizes[k] < 0.9 and self.organs.index(k) != skip_organ:
-                        intact_organ_ids = intact_organ_ids[intact_organ_ids != self.organs.index(k)]
-            
+                        excluded_organ_ids.add(self.organs.index(k))
+
             for organ_id in intact_organ_ids:
-                organ_name = self.organs[organ_id.item()]
+                if organ_id in excluded_organ_ids:
+                    continue
+
+                organ_name = self.organs[organ_id]
                 if organ_name not in test_organs:
                     continue
-                
-                organ_mask = torch.eq(mask, organ_id + 1).float()
+
+                organ_mask = torch.eq(mask, self.organ_mask_ids[organ_id]).float()
                 downsampled_masks = F.max_pool3d(
                     organ_mask.unsqueeze(0),
                     kernel_size=(16, 16, 32),
                     stride=(16, 16, 32)
                 )
-                
+
                 tokens = downsampled_masks[0].flatten() > 0
 
                 query = self.query_tokens[organ_id].unsqueeze(0).unsqueeze(0)

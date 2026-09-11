@@ -44,15 +44,15 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from finetune import CROP_SIZE, DATA_ROOT, ORGANS, PATCH_SIZE, PREPROCESSED_IMAGE_ROOT, PREPROCESSED_MASK_ROOT, RADGENOME_CSV, build_organ_captions
+from finetune import CROP_SIZE, DATA_ROOT, ORGAN_MASK_ID, ORGANS, PATCH_SIZE, PREPROCESSED_IMAGE_ROOT, PREPROCESSED_MASK_ROOT, RADGENOME_CSV, build_organ_captions
 from eval_finetune import DEFAULT_OUTPUT_DIR, build_eval_model, center_crop
 from compute_text_embeddings import clean_caption
 
-TEXT_EMBEDDINGS = os.path.join(DATA_ROOT, "EK_files", "organ_report_embeddings.npz")  # compute_text_embeddings.py 的输出
+TEXT_EMBEDDINGS = os.path.join(DATA_ROOT, "EK_files_train", "organ_report_embeddings.npz")  # compute_text_embeddings.py 的输出
 # 用第 40 个 epoch 的微调 checkpoint（不是自动挑最新的那个）——图像这一侧的 embedding
 # 依赖 vision_projs 训练得好不好，跟文本那边不一样，必须显式指定用哪个 epoch。
 FINETUNED_CHECKPOINT = os.path.join(DEFAULT_OUTPUT_DIR, "checkpoint_040.pth")
-OUTPUT_DIR = os.path.join(DATA_ROOT, "EK_files")  # organ_annotation.json 存这里
+OUTPUT_DIR = os.path.join(DATA_ROOT, "EK_files_train")  # organ_annotation.json 存这里
 TOP_K = 5
 MAX_SAMPLES = None  # 改成一个数字可以只跑一小部分病人，用于冒烟测试
 
@@ -64,7 +64,7 @@ def compute_image_embeddings(model, patient_ids, device):
     vision_proj，见 blip_pretrain.py:501-524）。
 
     是按"每个器官"跑一次 ViT 前向，不是按"每个病人"跑一次——每个器官都要单独裁一个
-    窗口，所以一个病人如果 9 个器官都在，最多要跑 9 次前向，比只跑一次贵不少；
+    窗口，所以一个病人如果 10 个器官都在，最多要跑 10 次前向，比只跑一次贵不少；
     `eval_finetune.py` 自己评估时对每个验证样本也是这么做的，不是这里特殊。
 
     调用 `forward_test_win` 时 `organ_logits`/`text_feat_dict` 都传空字典：我们只要
@@ -92,17 +92,21 @@ def compute_image_embeddings(model, patient_ids, device):
         mask = data["label"].as_tensor()[None].to(device)
 
         # 每个器官单独裁一个窗口，center crop， 算包围盒 → 围绕包围盒裁窗口 → pad 到 patch 整数倍
+        # 用 ORGAN_MASK_ID 而不是 ORGANS.index(organ)+1：'pleura' 在磁盘 mask 上没有
+        # 自己的 seg value，读的是 'lung' 的（见 finetune.py 模块开头的说明），
+        # ORGANS.index("pleura")+1 会指向一个磁盘上根本不存在的 seg value。
         whole_organ_sizes = {
-            organ: torch.eq(mask, ORGANS.index(organ) + 1).sum().item() for organ in ORGANS
+            organ: torch.eq(mask, ORGAN_MASK_ID[organ]).sum().item() for organ in ORGANS
         }
         organ_feat_dict = {}
         for organ_id, organ in enumerate(ORGANS):
             if whole_organ_sizes[organ] == 0:
                 continue  # this patient's preprocessed mask doesn't have this organ at all
 
-            window_patch, window_mask = center_crop(image, torch.eq(mask, organ_id + 1), crop_size=CROP_SIZE)
+            mask_value = ORGAN_MASK_ID[organ]
+            window_patch, window_mask = center_crop(image, torch.eq(mask, mask_value), crop_size=CROP_SIZE)
             window_mask = window_mask.float()
-            window_mask[window_mask == 1] = organ_id + 1
+            window_mask[window_mask == 1] = mask_value
             pad_data = pad_func({"image": window_patch[0], "label": window_mask[0]})
             window_patch, window_mask = pad_data["image"], pad_data["label"]
 
@@ -127,7 +131,7 @@ def compute_top_k_indices(image_feats, image_valid, text_feats, top_k, device):
     当查询向量，结果整行填 -1。
     """
     n = text_feats.shape[0]  # 病人数，24116
-    # 先建一个全 -1 的占位数组，形状 (病人数, 9个器官, top_k) —— 后面算出真实结果的
+    # 先建一个全 -1 的占位数组，形状 (病人数, 10个器官, top_k) —— 后面算出真实结果的
     # 地方才会覆盖成真的行号，算不出来的（比如这个器官没 mask）就保持 -1。
     all_indices = np.full((n, len(ORGANS), top_k), -1, dtype=np.int64)
 

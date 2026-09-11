@@ -13,6 +13,7 @@ from typing import Any, Callable, List, Sequence, Tuple, Union
 from lavis.common.config import Config
 from lavis.common.registry import registry
 from lavis.common.dist_utils import get_rank, init_distributed_mode
+from finetune import _apply_environment_patches, CHECKPOINT_PATH, DATA_ROOT
 
 
 def masks_to_boxes_3d(masks):
@@ -121,7 +122,7 @@ class DataFolder(Dataset):
     def __init__(self):
         super().__init__()
 
-        vis_root = 'data/processed_valid_images'
+        vis_root = os.path.join(DATA_ROOT, 'processed_valid_images')
 
         img_paths = []
         for root, _, files in os.walk(vis_root):
@@ -218,6 +219,8 @@ def evaluate():
     cfg = Config(args)
     init_distributed_mode(cfg.run_cfg)
 
+    _apply_environment_patches()
+
     datafolder = DataFolder()
     dataloader = DataLoader(
         datafolder,
@@ -240,112 +243,109 @@ def evaluate():
     model_cls = registry.get_model_class(model_config.arch)
     model = model_cls.from_config(model_config)
 
-    for epoch in range(10, 20):
-        print(f'Epoch: {epoch}')
+    ckpt_path = CHECKPOINT_PATH
 
-        ckpt_path = f'multi-modal-results/pretrain_ckpts/xxx/checkpoint_{epoch}.pth'
-        
-        ckpt = torch.load(
-            ckpt_path, map_location='cpu'
+    ckpt = torch.load(
+        ckpt_path, map_location='cpu'
+    )
+
+    model.load_state_dict(ckpt['model'], strict=False)
+
+    rank = get_rank()
+    torch.cuda.set_device(rank)
+
+    model.eval()
+    model.cuda()
+
+    # Set global precision for printing tensors
+    torch.set_printoptions(precision=2)
+
+    sw_batch_size = 4
+
+    overlap = 0.25
+    roi_size = (112, 288, 352)
+
+    results = []
+
+    text_feat_dict = model.prepare_text_feat(datafolder.test_items)
+
+    organ_feat_dict = {}
+
+    save_path = os.path.splitext(os.path.basename(ckpt_path))[0]
+
+    for i, (image, mask, test_items, meta_info) in enumerate(tqdm(dataloader, desc='Infer')):
+        fid = meta_info['file_name']
+        organ_feat_dict[fid] = {}
+
+        image = image[None].cuda()
+        mask = mask[None].cuda()
+
+        test_organs = meta_info['test_organ_names']
+
+        whole_organ_sizes = dict(zip(test_organs, [torch.eq(mask, datafolder.organs.index(test_organ) + 1).sum().item() for test_organ in test_organs]))
+
+        test_organs = [test_organ for test_organ in test_organs if whole_organ_sizes[test_organ] > 0]
+        test_items = [test_item for test_item in test_items if test_item[0] in test_organs]
+
+        image_size = list(image.shape[2:])
+        num_spatial_dims = len(image.shape) - 2
+
+        scan_interval = _get_scan_interval(
+            image_size, roi_size, num_spatial_dims, overlap
         )
-        
-        model.load_state_dict(ckpt['model'], strict=False)
+        slices = dense_patch_slices(image_size, roi_size, scan_interval)
+        num_win = len(slices)
 
-        rank = get_rank()
-        torch.cuda.set_device(rank)
+        organ_logits = dict(zip(test_items, [[] for _ in test_items]))
+        for k, v in organ_logits.items():
+            if not len(v):
+                organ_name = k[0]
+                organ_id = datafolder.organs.index(organ_name)
 
-        model.eval()
-        model.cuda()
+                window_patch, window_mask = center_crop(
+                    image,
+                    torch.eq(mask, organ_id + 1),
+                    crop_size=roi_size
+                )
+                window_mask = window_mask.float()
+                window_mask[window_mask == 1] = organ_id + 1
 
-        # Set global precision for printing tensors
-        torch.set_printoptions(precision=2)
-        
-        sw_batch_size = 4
+                pad_data = pad_func({'image': window_patch[0], 'label': window_mask[0]})
+                window_patch, window_mask = pad_data['image'], pad_data['label']
 
-        overlap = 0.25
-        roi_size = (112, 288, 352)
+                # print('EXTRA', organ_name, window_patch.size())
 
-        results = []
-        
-        text_feat_dict = model.prepare_text_feat(datafolder.test_items)
+                organ_logits = model.forward_test_win(
+                    window_patch[None],
+                    window_mask[None],
+                    organ_logits,
+                    test_organs,
+                    text_feat_dict,
+                    organ_feat_dict[fid],
+                    whole_organ_sizes,
+                    skip_organ=organ_id
+                )
 
-        organ_feat_dict = {}
+        res = [meta_info['file_name']] + [''] * len(datafolder.test_items)
+        organ_logits = {item: probs for item, probs in organ_logits.items() if len(probs) > 0}
+        for item, probs in organ_logits.items():
+            res[datafolder.test_items.index(item) + 1] = np.concatenate(probs).mean(0)[1]
+        results.append(res)
 
-        save_path = '_'.join(ckpt_path.replace('.pth', '').split('/')[1:])
+    if dist.is_initialized():
+        results = np.concatenate(all_gather(results), axis=0)
+        organ_feat_dict = all_gather(organ_feat_dict)
+    else:
+        organ_feat_dict = [organ_feat_dict]
 
-        for i, (image, mask, test_items, meta_info) in enumerate(tqdm(dataloader, desc='Infer')):
-            fid = meta_info['file_name']
-            organ_feat_dict[fid] = {}
+    if rank == 0:
+        os.makedirs('rate_res', exist_ok=True)
+        pd.DataFrame(
+            results,
+            columns=['file_name'] + ['_'.join(k) for k in datafolder.test_items]
+        ).to_csv(f'rate_res/{save_path}.csv', index=False, encoding='utf-8')
 
-            image = image[None].cuda()
-            mask = mask[None].cuda()
-
-            test_organs = meta_info['test_organ_names']
-            
-            whole_organ_sizes = dict(zip(test_organs, [torch.eq(mask, datafolder.organs.index(test_organ) + 1).sum().item() for test_organ in test_organs]))    
-
-            test_organs = [test_organ for test_organ in test_organs if whole_organ_sizes[test_organ] > 0]
-            test_items = [test_item for test_item in test_items if test_item[0] in test_organs]
-
-            image_size = list(image.shape[2:])
-            num_spatial_dims = len(image.shape) - 2
-
-            scan_interval = _get_scan_interval(
-                image_size, roi_size, num_spatial_dims, overlap
-            )
-            slices = dense_patch_slices(image_size, roi_size, scan_interval)
-            num_win = len(slices)
-
-            organ_logits = dict(zip(test_items, [[] for _ in test_items]))
-            for k, v in organ_logits.items():
-                if not len(v):
-                    organ_name = k[0]
-                    organ_id = datafolder.organs.index(organ_name)
-
-                    window_patch, window_mask = center_crop(
-                        image,
-                        torch.eq(mask, organ_id + 1),
-                        crop_size=roi_size
-                    )
-                    window_mask = window_mask.float()
-                    window_mask[window_mask == 1] = organ_id + 1
-
-                    pad_data = pad_func({'image': window_patch[0], 'label': window_mask[0]})
-                    window_patch, window_mask = pad_data['image'], pad_data['label']
-
-                    # print('EXTRA', organ_name, window_patch.size())
-
-                    organ_logits = model.forward_test_win(
-                        window_patch[None], 
-                        window_mask[None],
-                        organ_logits,
-                        test_organs,
-                        text_feat_dict,
-                        organ_feat_dict[fid],
-                        whole_organ_sizes,
-                        skip_organ=organ_id
-                    )
-                
-            res = [meta_info['file_name']] + [''] * len(datafolder.test_items)
-            organ_logits = {item: probs for item, probs in organ_logits.items() if len(probs) > 0}
-            for item, probs in organ_logits.items():
-                res[datafolder.test_items.index(item) + 1] = np.concatenate(probs).mean(0)[1]
-            results.append(res)
-        
-        if dist.is_initialized():
-            results = np.concatenate(all_gather(results), axis=0)
-            organ_feat_dict = all_gather(organ_feat_dict)
-        else:
-            organ_feat_dict = [organ_feat_dict]
-        
-        if rank == 0:
-            os.makedirs('rate_res', exist_ok=True)
-            pd.DataFrame(
-                results,
-                columns=['file_name'] + ['_'.join(k) for k in datafolder.test_items]
-            ).to_csv(f'rate_res/{save_path}.csv', index=False, encoding='utf-8')
-            
-            print('Save csv file successfully!')
+        print('Save csv file successfully!')
 
 if __name__ == '__main__':
     evaluate()

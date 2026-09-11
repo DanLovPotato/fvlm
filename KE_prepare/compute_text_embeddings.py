@@ -21,17 +21,40 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import finetune
 from finetune import (
-    CHECKPOINT_PATH, CTOrganDataset, DATA_ROOT, ORGANS, RADGENOME_CSV,
+     CTOrganDataset, CHECKPOINT_PATH, ORGANS,
     _apply_environment_patches, build_organ_captions,
 )
+
+DATA_ROOT = r"/mnt/researchdrive/ptiwari9/Staff_Trainee_Folders/Dan/chestCT/data/dataset"
+
+# 改这一个变量就能切换 train/valid，不用再去手动改 finetune.py 里的注释。
+SPLIT = "train"  # "train" 或 "valid"
+
+# CTOrganDataset.__init__（finetune.py）内部直接读 finetune 模块自己的
+# PREPROCESSED_IMAGE_ROOT/PREPROCESSED_MASK_ROOT 全局变量，不是构造函数参数——
+# 所以不能只在这个文件里定义同名变量（那样 CTOrganDataset 根本看不到，还是会
+# 用 finetune.py 里当前生效的那个）。必须真的去改 finetune 模块自己的属性，
+# CTOrganDataset 是在调用时才查这两个名字，改了之后它就会用新值。
+finetune.PREPROCESSED_IMAGE_ROOT = os.path.join(DATA_ROOT, f"processed_{SPLIT}_images")
+finetune.PREPROCESSED_MASK_ROOT = os.path.join(DATA_ROOT, f"processed_{SPLIT}_masks")
+
+# RADGENOME_CSV 不一样：build_organ_captions(csv_path, organs) 是当参数传进去的，
+# 所以这里直接定义一个新的、不 import finetune.py 里那份就行。
+_RADGENOME_CSV_NAME = {"train": "train_region_report.csv", "valid": "validation_region_report.csv"}[SPLIT]
+RADGENOME_CSV = os.path.join(DATA_ROOT, "radgenome_files", _RADGENOME_CSV_NAME)
 
 # 这里用的是原生 4 器官的 CHECKPOINT_PATH，不是某个微调过的 checkpoint——因为
 # text_encoder/text_proj 在发布的原始 checkpoint 和任何微调后的 checkpoint 之间都是
 # 同一份冻结权重，完全一样，所以 expand_organs()、用哪个微调 checkpoint，这些跟
 # "算文本 embedding"这件事毫无关系，改这个常量也不需要。
 CHECKPOINT = CHECKPOINT_PATH
-OUTPUT_DIR = os.path.join(DATA_ROOT, "EK_files")  # organ_report_embeddings.npz 存这里
+# EK_files_train / EK_files_val - 跟 find_similar_reports.py/_val.py 用的目录名保持
+# 一致（那两个脚本固定叫 "val" 不是 "valid"），所以这里单独映射一下后缀，不能直接拼
+# f"EK_files_{SPLIT}"。
+_EK_DIR_SUFFIX = {"train": "train", "valid": "val"}[SPLIT]
+OUTPUT_DIR = os.path.join(DATA_ROOT, f"EK_files_{_EK_DIR_SUFFIX}")  # organ_report_embeddings.npz 存这里
 BATCH_SIZE = 64
 MAX_SAMPLES = None  # 改成一个数字可以只跑一小部分病人，用于冒烟测试
 
@@ -105,7 +128,8 @@ def clean_caption(text, organ):
     的输入。
 
     只删"模板句 + 真实发现"这种拼接情况下多余的模板前缀，不删纯粹的模板句本身
-    但其实24116 个病人 × 9 个器官，没有一条命中这里的if
+    但其实在旧的 9 器官跑法上，24116 个病人 × 9 个器官没有一条命中这里的 if——
+    加了 pleura（第 10 个器官）之后这个统计没有重新跑过，不能直接当结论用。
     """
     template = f"{organ} shows no significant abnormalities."
     if text.startswith(template) and text != template:
@@ -158,6 +182,7 @@ def main():
     samples = dataset.samples
     if MAX_SAMPLES is not None:
         samples = samples[:MAX_SAMPLES]
+    # patient_ids = train_{病人号}_{scan}_{reconstruction}
     patient_ids = [sample_id for _, _, sample_id in samples]
     print(f"{len(patient_ids)} patients, {len(ORGANS)} organs")
 

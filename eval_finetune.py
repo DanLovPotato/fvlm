@@ -1,4 +1,4 @@
-"""Zero-shot pathology-classification eval for the finetuned 9-organ checkpoint,
+"""Zero-shot pathology-classification eval for the finetuned 10-organ checkpoint,
 adapted from fvlm_original/eval.py - kept as a separate script (not modifying
 eval.py) since eval.py is upstream reference code built for the original 4-organ
 release checkpoint, the same way finetune.py itself was adapted from the original
@@ -8,30 +8,31 @@ Three things differ from eval.py, matching the same kind of adaptations finetune
 made to the original training script:
 
 1. Organ-id mapping: eval.py assumes organs=['lung','heart','esophagus','aorta'] with
-   ids 1..4. Our merged masks use the 9-organ order from preprocess.py's ORGANS list
-   (lung=6, no aorta) - using eval.py's id scheme against our mask files would silently
-   score the wrong organ's voxels, not crash. TEST_ITEMS below drops the 'aorta' item
-   (no aorta mask exists in this project) and every organ-id lookup goes through
-   ORGANS.index(...) instead of a hardcoded 4-organ list.
+   ids 1..4. Our merged masks use ORGAN_MASK_ID (finetune.py) instead - each organ's
+   seg value, which is position+1 in preprocess.py's on-disk 9-organ mask order except
+   for 'pleura', which reads 'lung's value - using eval.py's id scheme against our mask
+   files would silently score the wrong organ's voxels, not crash. TEST_ITEMS below
+   drops the 'aorta' item (no aorta mask exists in this project) and every organ-id
+   lookup goes through ORGANS.index(...)/ORGAN_MASK_ID[...] instead of a hardcoded
+   4-organ list.
 
 2. Model construction: eval.py builds the model at its native 4-organ shape via
    model_cls.from_config() and loads a checkpoint with strict=False. Our finetuned
-   checkpoint's query_tokens/vision_projs are shaped for 9 organs -
+   checkpoint's query_tokens/vision_projs are shaped for 10 organs -
    load_state_dict tolerates missing/extra *keys* under strict=False but still raises
    on a shape mismatch for a key present in both, so this would crash. build_eval_model()
    below reuses finetune.py's own build_pretrained_model()+expand_organs() two-step
    (imported directly, not copied - finetune.py is this project's own code, unlike the
-   vendored eval.py/blip_pretrain.py) to get the same 9-organ skeleton finetune.py
+   vendored eval.py/blip_pretrain.py) to get the same 10-organ skeleton finetune.py
    trained, then loads our finetuned state dict into it with strict=True.
 
 3. Data layout: eval.py's DataFolder hardcodes vis_root='data/processed_valid_images'
    (relative, doesn't exist here) and does mask_path = image_path.replace('images',
-   'masks'). EvalOrganDataset below defaults to this project's PREPROCESSED_IMAGE_ROOT/
-   PREPROCESSED_MASK_ROOT (the same constants finetune.py's CTOrganDataset uses) but
-   takes image_root/mask_root overrides - --split valid (the default; see parse_args())
-   points it at processed_valid_images/masks instead, a genuinely held-out patient set
-   finetune.py's training never touches, unlike the train folders. Image/mask pairing
-   is by matching filename across the two directories, like CTOrganDataset does.
+   'masks'). EvalOrganDataset below takes image_root/mask_root explicitly - evaluate()
+   always passes IMAGE_ROOT/MASK_ROOT (processed_valid_images/masks, this project's
+   real held-out patient set finetune.py's training never touches - no --split flag,
+   this script never evaluates the train folders). Image/mask pairing is by matching
+   filename across the two directories, like CTOrganDataset does.
 
 masks_to_boxes_3d() and center_crop() are copied verbatim from eval.py (pure tensor
 math, no organ-count or path assumptions) rather than imported, since eval.py is
@@ -41,19 +42,17 @@ dependency of this project's own scripts. eval.py's unused sliding-window setup
 loop falls through to a single center_crop per organ) and its distributed-eval
 plumbing aren't carried over, matching finetune.py's own single-GPU-only style.
 
-Historical note, now resolved: ORGANS in finetune.py/preprocess.py used to include
-'pleura' (its raw mask was voxel-for-voxel identical to lung's, which silently erased
-lung's label every time merge_organ_masks() ran - see finetune.py's module
-docstring). 'pleura' was removed from ORGANS to fix that, which shifted every organ
-listed after it (old thyroid=9/trachea=10 -> new thyroid=8/trachea=9). Both
-processed_valid_masks/images and every checkpoint this script can use are now
-regenerated/trained under the current 9-organ numbering, so this no longer needs
-checking before running.
+'pleura's raw mask is voxel-for-voxel identical to 'lung's in this dataset (see
+finetune.py's module docstring), so it's read via the same seg value as lung
+(ORGAN_MASK_ID) rather than getting its own - forward_test_win() (blip_pretrain.py)
+resolves organ identity from ORGAN_MASK_ID, not from seg-value-equals-position+1, so
+both organs still get their own query_tokens row / vision_proj / score from a shared
+mask window.
 
 Only lung/heart/esophagus have curated pathology text prompts here (carried over from
-eval.py's original CT-RATE-derived list). The 6 organs added by finetune.py's
-expand_organs() (abdomen, bone, breast, mediastinum, thyroid, trachea and bronchie)
-have partial coverage below, added after checking keyword support against
+eval.py's original CT-RATE-derived list). The 7 organs added by finetune.py's
+expand_organs() (abdomen, bone, breast, mediastinum, pleura, thyroid, trachea and
+bronchie) have partial coverage below, added after checking keyword support against
 validation_vqa_abnormality.csv (see PATHOLOGY_KEYWORDS).
 """
 import argparse
@@ -68,44 +67,45 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from finetune import (
-    CHECKPOINT_PATH, CROP_SIZE, DATA_ROOT, DEFAULT_OUTPUT_DIR, FROZEN_ORGANS, ORGANS,
-    PATCH_SIZE, PREPROCESSED_IMAGE_ROOT, PREPROCESSED_MASK_ROOT,
+    CHECKPOINT_PATH, CROP_SIZE, DATA_ROOT, DEFAULT_OUTPUT_DIR, FROZEN_ORGANS, ORGAN_MASK_ID,
+    ORGANS, PATCH_SIZE, PREPROCESSED_IMAGE_ROOT, PREPROCESSED_MASK_ROOT,
     _apply_environment_patches, build_pretrained_model, expand_organs,
 )
 
+# This script only ever evaluates the held-out validation split - see module
+# docstring. Fixed paths instead of a --split flag: processed_valid_images/masks is
+# the real held-out set (the train folders were never actually held out from
+# finetune.py's training data), and validation_vqa_abnormality.csv is the matching
+# ground-truth file - its rows are keyed by valid_XXX patient ids, which only lines
+# up with predictions read from processed_valid_images/masks.
+IMAGE_ROOT = os.path.join(DATA_ROOT, "processed_valid_images")
+MASK_ROOT = os.path.join(DATA_ROOT, "processed_valid_masks")
 # Ground truth for scoring TEST_ITEMS predictions - free-text abnormality findings per
 # (patient, organ), NOT a binary structured-label file (no such file exists in this
-# project's data; see the conversation this was added in for what was checked).
-def vqa_abnormality_csv(split):
-    """train/valid ground-truth files are keyed by disjoint patient-id prefixes
-    (train_XXX vs valid_XXX) - must match whichever split EvalOrganDataset is
-    actually reading images from, or every row silently fails to match. Naming is
-    inconsistent between the data folders (train_/valid_, short form) and these CSVs
-    (train_/validation_, full word) - not something to "fix" file-side, just map it.
-    """
-    csv_prefix = {"train": "train", "valid": "validation"}[split]
-    return os.path.join(DATA_ROOT, "radgenome_files", f"{csv_prefix}_vqa_abnormality.csv")
+# project's data; see the conversation this was added in for what was checked). Naming
+# is inconsistent between the data folders ("valid", short form) and this CSV
+# ("validation", full word) - not something to "fix" file-side, just a fixed mapping.
+VQA_ABNORMALITY_CSV = os.path.join(DATA_ROOT, "radgenome_files", "validation_vqa_abnormality.csv")
 
 # eval.py's original 4-organ test_items (minus 'aorta' - no aorta mask exists in this
 # project's organ scheme, see module docstring point 1) extended to all organs ORGANS
-# now covers. 'pleura' isn't one of them - dropped from ORGANS itself in finetune.py/
-# preprocess.py because its raw mask was voxel-for-voxel identical to lung's, which was
-# silently erasing lung's label during merge_organ_masks() (see finetune.py's module
-# docstring for the full explanation). Every extension item below was only added after
-# checking its keyword actually appears at least 15 times in real free text - first
-# pass against validation_vqa_abnormality.csv (1,564 patients), later cross-checked
-# against the much larger train_vqa_abnormality.csv (24,123 patients) once that became
-# available, which both confirmed the original picks and surfaced several more
-# (abdomen/bone additions below) that weren't obviously frequent at the smaller sample
-# size. Candidates that came back at 0 or single digits even in the larger file (e.g.
-# mediastinum 'aortic aneurysm', thyroid 'goiter', breast 'breast mass') were left out.
+# now covers, pleura included (its own Anatomy=='pleura' rows in
+# train_vqa_abnormality.csv, not lung's - despite sharing lung's seg value via
+# ORGAN_MASK_ID, RadGenome/vqa still describe pleura findings separately). Every
+# extension item below was only added after checking its keyword actually appears at
+# least 15 times in real free text - first pass against validation_vqa_abnormality.csv
+# (1,564 patients), later cross-checked against the much larger train_vqa_abnormality.csv
+# (24,123 patients) once that became available, which both confirmed the original picks
+# and surfaced several more (abdomen/bone/pleura additions below) that weren't obviously
+# frequent at the smaller sample size. Candidates that came back at 0 or single digits
+# even in the larger file (e.g. mediastinum 'aortic aneurysm', thyroid 'goiter', breast
+# 'breast mass', pleura 'pleural calcification'/'pleural plaque') were left out.
 TEST_ITEMS = [
     ('lung', 'Emphysema', 'Not Emphysema.', 'Emphysema.'),
     ('lung', 'Atelectasis', 'Not Atelectatic.', 'Atelectatic.'),
     ('lung', 'Lung nodule', 'Not Nodule.', 'Nodule.'),
     ('lung', 'Lung opacity', 'Not Opacity.', 'Opacity.'),
     ('lung', 'Pulmonary fibrotic sequela', 'Not Pulmonary fibrotic.', 'Pulmonary fibrotic.'),
-    ('lung', 'Pleural effusion', 'Not Pleural effusion.', 'Pleural effusion.'),
     ('lung', 'Mosaic attenuation pattern', 'Not Mosaic attenuation pattern.', 'Mosaic attenuation pattern.'),
     ('lung', 'Peribronchial thickening', 'Not Peribronchial thickening.', 'Peribronchial thickening.'),
     ('lung', 'Consolidation', 'Not Consolidation.', 'Consolidation.'),
@@ -137,6 +137,9 @@ TEST_ITEMS = [
     ('trachea and bronchie', 'Peribronchial thickening', 'Not Peribronchial thickening.', 'Peribronchial thickening.'),
     ('trachea and bronchie', 'Bronchiectasis', 'Not Bronchiectasis.', 'Bronchiectasis.'),
     ('trachea and bronchie', 'Tracheal diverticulum', 'Not Tracheal diverticulum.', 'Tracheal diverticulum.'),
+    ('pleura', 'Pleural effusion', 'Not Pleural effusion.', 'Pleural effusion.'),
+    ('pleura', 'Subpleural nodule', 'Not Subpleural nodule.', 'Subpleural nodule.'),
+    ('pleura', 'Pleural thickening', 'Not Pleural thickening.', 'Pleural thickening.'),
 ]
 
 # Keyword(s) that must appear (after lowercasing and collapsing '-' to ' ') in a
@@ -170,7 +173,6 @@ PATHOLOGY_KEYWORDS = {
     ('lung', 'Lung nodule'): ['nodul'],
     ('lung', 'Lung opacity'): ['opacit', 'ground glass'],
     ('lung', 'Pulmonary fibrotic sequela'): ['fibro'],
-    ('lung', 'Pleural effusion'): ['pleural effusion'],
     ('lung', 'Consolidation'): ['consolidat'],
     ('lung', 'Bronchiectasis'): ['bronchiecta'],
     ('lung', 'Interlobular septal thickening'): ['septal thick', 'interlobular'],
@@ -204,6 +206,9 @@ PATHOLOGY_KEYWORDS = {
     ('trachea and bronchie', 'Peribronchial thickening'): ['peribronchial'],
     ('trachea and bronchie', 'Bronchiectasis'): ['bronchiecta'],
     ('trachea and bronchie', 'Tracheal diverticulum'): ['diverticulum'],
+    ('pleura', 'Pleural effusion'): ['pleural effusion'],
+    ('pleura', 'Subpleural nodule'): ['subpleural nodul'],
+    ('pleura', 'Pleural thickening'): ['pleural thicken'],
 }
 
 
@@ -281,9 +286,9 @@ class EvalOrganDataset(Dataset):
     replacement (see module docstring, point 3).
 
     image_root/mask_root default to PREPROCESSED_IMAGE_ROOT/PREPROCESSED_MASK_ROOT
-    (the train folders) for backward compatibility, but --split valid in
-    parse_args() below points these at the real held-out processed_valid_images/masks
-    instead - the train folders were never a genuine held-out set.
+    (the train folders) if not passed explicitly, but evaluate() below always passes
+    IMAGE_ROOT/MASK_ROOT (processed_valid_images/masks) - the train folders were never
+    a genuine held-out set, so this script never points here at them.
     """
 
     def __init__(self, organs, test_items, image_root=None, mask_root=None):
@@ -343,7 +348,7 @@ def build_eval_model(finetuned_checkpoint_path, device):
     """
     _apply_environment_patches()
     model = build_pretrained_model(CHECKPOINT_PATH)
-    expand_organs(model, ORGANS, FROZEN_ORGANS)
+    expand_organs(model, ORGANS, FROZEN_ORGANS, ORGAN_MASK_ID)
 
     if finetuned_checkpoint_path is not None:
         ckpt = torch.load(finetuned_checkpoint_path, map_location="cpu", weights_only=False)
@@ -416,6 +421,25 @@ def score_against_ground_truth(df, ground_truth):
         print(f"  {col}: n={len(y_true)} base_rate={base_rate:.3f} accuracy={accuracy:.3f} auc={auc:.3f}")
 
 
+def _all_checkpoints(epochs=None):
+    """Every checkpoint_XXX.pth under DEFAULT_OUTPUT_DIR, sorted oldest epoch first -
+    for --all-epochs. Same directory/naming _default_checkpoint() picks the latest from.
+
+    epochs: optional list of epoch numbers (the XXX in checkpoint_XXX.pth) to keep, for
+    --epochs - e.g. [0, 9, 19, 29, 39, 49] instead of every one of the 50.
+    """
+    if not os.path.isdir(DEFAULT_OUTPUT_DIR):
+        return []
+    files = sorted(
+        f for f in os.listdir(DEFAULT_OUTPUT_DIR)
+        if f.startswith("checkpoint_") and f.endswith(".pth")
+    )
+    if epochs is not None:
+        wanted = set(epochs)
+        files = [f for f in files if int(f[len("checkpoint_"):-len(".pth")]) in wanted]
+    return [os.path.join(DEFAULT_OUTPUT_DIR, f) for f in files]
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -430,51 +454,46 @@ def parse_args():
              "Ignores --checkpoint.",
     )
     parser.add_argument(
-        "--split", choices=["train", "valid"], default="valid",
-        help="valid = the real held-out processed_valid_images/masks set; train was "
-             "never actually held out from finetune.py's training data",
+        "--all-epochs", action="store_true",
+        help="evaluate every checkpoint_XXX.pth under DEFAULT_OUTPUT_DIR (or just --epochs' "
+             "subset of them), one after another, each saved to its own CSV (same naming as "
+             "running --checkpoint once per file). Ignores --checkpoint/--untrained. Re-runs "
+             "the full dataset per checkpoint, so this costs roughly (number of checkpoints "
+             "run) times a single evaluate() run.",
+    )
+    parser.add_argument(
+        "--epochs", default=None,
+        help="comma-separated epoch numbers to run with --all-epochs, e.g. '0,9,19,29,39,49' "
+             "instead of every checkpoint found. Requires --all-epochs.",
     )
     parser.add_argument("--output-dir", default=os.path.join(DEFAULT_OUTPUT_DIR, "eval_results"))
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--max-samples", type=int, default=None, help="for smoke-testing on a subset")
     args = parser.parse_args()
-    if not args.untrained and args.checkpoint is None:
+    if args.epochs is not None:
+        if not args.all_epochs:
+            parser.error("--epochs requires --all-epochs")
+        args.epochs = [int(e) for e in args.epochs.split(",")]
+    if args.all_epochs:
+        if not _all_checkpoints(args.epochs):
+            missing = f" for epochs {args.epochs}" if args.epochs else ""
+            parser.error(f"no matching checkpoint_XXX.pth files found under {DEFAULT_OUTPUT_DIR}{missing}")
+    elif not args.untrained and args.checkpoint is None:
         parser.error("no checkpoint found under DEFAULT_OUTPUT_DIR and --checkpoint not given (or pass --untrained)")
     return args
 
 
-@torch.inference_mode()
-def evaluate():
-    args = parse_args()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    image_root = os.path.join(DATA_ROOT, f"processed_{args.split}_images")
-    mask_root = os.path.join(DATA_ROOT, f"processed_{args.split}_masks")
-    dataset = EvalOrganDataset(ORGANS, TEST_ITEMS, image_root=image_root, mask_root=mask_root)
-    if args.max_samples is not None:
-        dataset.img_paths = dataset.img_paths[:args.max_samples]
-    if args.untrained:
-        print(f"Evaluating on {len(dataset)} samples against the UNTRAINED baseline "
-              f"(no finetuning at all - frozen organs keep pretrained weights, rest are random init)")
-    else:
-        print(f"Evaluating on {len(dataset)} samples against checkpoint {args.checkpoint}")
-    print(f"{len(TEST_ITEMS)} organ-pathology test items, organs: {sorted(set(item[0] for item in TEST_ITEMS))}")
-
-    loader = DataLoader(
-        dataset, batch_size=1, shuffle=False, num_workers=args.num_workers,
-        drop_last=False, collate_fn=collate_fn,
-    )
-
-    pad_func = transforms.DivisiblePadd(
-        keys=["image", "label"], k=PATCH_SIZE, mode="constant", constant_values=0, method="end",
-    )
-
-    model = build_eval_model(None if args.untrained else args.checkpoint, device)
+def _evaluate_one(model, dataset, loader, pad_func, device, output_dir, ckpt_name, ground_truth, vqa_csv):
+    """Runs the full dataset through one already-built model, saves its predictions to
+    output_dir/{ckpt_name}.csv, and prints per-item accuracy/AUC against ground_truth (if
+    available). Split out of evaluate() so --all-epochs can call this once per checkpoint
+    while reusing the same dataset/loader across all of them.
+    """
     text_feat_dict = model.prepare_text_feat(TEST_ITEMS)
 
     organ_feat_dict = {}
     results = []
-    for image, mask, test_items, meta_info in tqdm(loader, desc="Infer"):
+    for image, mask, test_items, meta_info in tqdm(loader, desc=f"Infer ({ckpt_name})"):
         fid = meta_info["file_name"]
         organ_feat_dict[fid] = {}
 
@@ -484,7 +503,7 @@ def evaluate():
         test_organs = meta_info["test_organ_names"]
         whole_organ_sizes = dict(zip(
             test_organs,
-            [torch.eq(mask, ORGANS.index(organ) + 1).sum().item() for organ in test_organs],
+            [torch.eq(mask, ORGAN_MASK_ID[organ]).sum().item() for organ in test_organs],
         ))
         test_organs = [organ for organ in test_organs if whole_organ_sizes[organ] > 0]
         test_items = [item for item in test_items if item[0] in test_organs]
@@ -495,12 +514,13 @@ def evaluate():
                 continue  # already filled in by an earlier item sharing this organ
             organ_name = k[0]
             organ_id = ORGANS.index(organ_name)
+            mask_value = ORGAN_MASK_ID[organ_name]
 
             window_patch, window_mask = center_crop(
-                image, torch.eq(mask, organ_id + 1), crop_size=CROP_SIZE,
+                image, torch.eq(mask, mask_value), crop_size=CROP_SIZE,
             )
             window_mask = window_mask.float()
-            window_mask[window_mask == 1] = organ_id + 1
+            window_mask[window_mask == 1] = mask_value
 
             pad_data = pad_func({"image": window_patch[0], "label": window_mask[0]})
             window_patch, window_mask = pad_data["image"], pad_data["label"]
@@ -516,9 +536,8 @@ def evaluate():
             row[TEST_ITEMS.index(item) + 1] = np.concatenate(probs).mean(0)[1]
         results.append(row)
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    ckpt_name = "untrained" if args.untrained else os.path.splitext(os.path.basename(args.checkpoint))[0]
-    out_path = os.path.join(args.output_dir, f"{ckpt_name}.csv")
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, f"{ckpt_name}.csv")
     df = pd.DataFrame(results, columns=["file_name"] + ["_".join(item[:2]) for item in TEST_ITEMS])
     df.to_csv(out_path, index=False, encoding="utf-8")
     print(f"Saved {out_path}")
@@ -529,12 +548,53 @@ def evaluate():
     for item, count in scored.items():
         print(f"  {item}: {count}/{len(df)}")
 
-    vqa_csv = vqa_abnormality_csv(args.split)
-    if os.path.exists(vqa_csv):
-        ground_truth = load_ground_truth(vqa_csv)
+    if ground_truth is not None:
         score_against_ground_truth(df, ground_truth)
     else:
         print(f"\n{vqa_csv} not found - skipping ground-truth scoring.")
+
+
+@torch.inference_mode()
+def evaluate():
+    args = parse_args()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    dataset = EvalOrganDataset(ORGANS, TEST_ITEMS, image_root=IMAGE_ROOT, mask_root=MASK_ROOT)
+    if args.max_samples is not None:
+        dataset.img_paths = dataset.img_paths[:args.max_samples]
+    print(f"{len(TEST_ITEMS)} organ-pathology test items, organs: {sorted(set(item[0] for item in TEST_ITEMS))}")
+
+    loader = DataLoader(
+        dataset, batch_size=1, shuffle=False, num_workers=args.num_workers,
+        drop_last=False, collate_fn=collate_fn,
+    )
+
+    pad_func = transforms.DivisiblePadd(
+        keys=["image", "label"], k=PATCH_SIZE, mode="constant", constant_values=0, method="end",
+    )
+
+    vqa_csv = VQA_ABNORMALITY_CSV
+    ground_truth = load_ground_truth(vqa_csv) if os.path.exists(vqa_csv) else None
+
+    if args.all_epochs:
+        checkpoints = _all_checkpoints(args.epochs)
+        print(f"Evaluating on {len(dataset)} samples against {len(checkpoints)} checkpoints under {DEFAULT_OUTPUT_DIR}")
+        for checkpoint_path in checkpoints:
+            ckpt_name = os.path.splitext(os.path.basename(checkpoint_path))[0]
+            print(f"\n=== {ckpt_name} ===")
+            model = build_eval_model(checkpoint_path, device)
+            _evaluate_one(model, dataset, loader, pad_func, device, args.output_dir, ckpt_name, ground_truth, vqa_csv)
+        return
+
+    if args.untrained:
+        print(f"Evaluating on {len(dataset)} samples against the UNTRAINED baseline "
+              f"(no finetuning at all - frozen organs keep pretrained weights, rest are random init)")
+    else:
+        print(f"Evaluating on {len(dataset)} samples against checkpoint {args.checkpoint}")
+
+    ckpt_name = "untrained" if args.untrained else os.path.splitext(os.path.basename(args.checkpoint))[0]
+    model = build_eval_model(None if args.untrained else args.checkpoint, device)
+    _evaluate_one(model, dataset, loader, pad_func, device, args.output_dir, ckpt_name, ground_truth, vqa_csv)
 
 
 if __name__ == "__main__":

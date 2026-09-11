@@ -9,6 +9,10 @@ model:
   load_pretrained: True
   pretrained: "https://storage.googleapis.com/sfr-vision-language-research/BLIP/models/model_base_capfilt_large.pth"
 
+  # BiomedVLP-CXR-BERT-specialized isn't a real HF repo id, so from_pretrained() 404s;
+  # eval.py overwrites the text encoder from its own checkpoint anyway, so skip the fetch.
+  text_encoder_from_pretrained: False
+
   vit_type: "base"
   vit_grad_ckpt: False
   vit_ckpt_layer: 0

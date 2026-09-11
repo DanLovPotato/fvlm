@@ -1,0 +1,41 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "eval_finetune.py (smoke test)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/mnt/local/data/dxiang23/conda/envs/reg2rg/bin/python",
+            "program": "${workspaceFolder}/eval_finetune.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "--max-samples", "5",
+                "--num-workers", "0"
+            ]
+        },
+        {
+            "name": "eval_finetune.py (current args)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/mnt/local/data/dxiang23/conda/envs/reg2rg/bin/python",
+            "program": "${workspaceFolder}/eval_finetune.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": []
+        },
+        {
+            "name": "eval.py",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/mnt/local/data/dxiang23/conda/envs/reg2rg/bin/python",
+            "program": "${workspaceFolder}/eval.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": []
+        }
+    ]
+}

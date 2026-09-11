@@ -5,19 +5,20 @@ way train.py/eval.py already do.
 
 The released checkpoint (model.pth) was pretrained over exactly 4 organs (lung, heart,
 esophagus, aorta) - confirmed by the shape of its query_tokens/vision_projs. Our region
-masks and RadGenome per-organ reports originally covered 10 organs, but 'pleura' is
-dropped here: its raw segmentation mask is voxel-for-voxel identical to 'lung's in this
-dataset (100% overlap, confirmed by spot-checking multiple patients), so keeping both as
-separate classes only meant merge_organ_masks() silently erased every lung label (pleura
-is processed after lung in ORGANS order, so its identical mask always overwrote lung's)
-- the model was never getting real lung supervision. Dropping pleura leaves 9 organs (see
-ORGANS below) and don't include a standalone aorta mask (any "mediastinum/aorta"
-RadGenome sentences fold into the mediastinum caption via the "/"-split in
-build_organ_captions), so this script expands the organ head to those 9 organs: the 3
-that overlap with the checkpoint (lung, heart, esophagus) keep their pretrained
-query_tokens row and vision_proj exactly as released - frozen, not just warm-started -
-and the other 6 (abdomen, bone, breast, mediastinum, thyroid, trachea and bronchie) get
-freshly initialized, trainable query_tokens rows and vision_projs.
+masks and RadGenome per-organ reports cover 10 organs, so this script expands the organ
+head to all 10: the 3 that overlap with the checkpoint (lung, heart, esophagus) keep
+their pretrained query_tokens row and vision_proj exactly as released - frozen, not just
+warm-started - and the other 7 (abdomen, bone, breast, mediastinum, pleura, thyroid,
+trachea and bronchie) get freshly initialized, trainable query_tokens rows and
+vision_projs. No standalone aorta mask (any "mediastinum/aorta" RadGenome sentences fold
+into the mediastinum caption via the "/"-split in build_organ_captions).
+
+'pleura's raw mask is voxel-for-voxel identical to 'lung's in this dataset, so it's never
+given its own id in the on-disk single-channel mask (MASK_SOURCE_ORGANS, still 9 organs,
+written by preprocess.py) - ORGAN_MASK_ID instead points "pleura" at lung's id, so both
+organs are read from the same seg value (see count_intact_organs /
+blip_pretrain.py::forward()). Both still get their own query_tokens row, vision_proj,
+and RadGenome caption.
 
 Everything shared across organs - the visual encoder, text encoder, text_proj,
 temperature, and the cross-attention pooling module - is also frozen, since training
@@ -53,16 +54,39 @@ DATA_ROOT = r"/mnt/researchdrive/ptiwari9/Staff_Trainee_Folders/Dan/chestCT/data
 # CROP_SIZE, exactly like fvlm_original's own processed_{split}_images/masks
 # convention. Nothing here reads the raw train_preprocessed/train_region_mask
 # volumes directly; that only happens in preprocess.py.
+# PREPROCESSED_IMAGE_ROOT = os.path.join(DATA_ROOT, "processed_valid_images")
+# PREPROCESSED_MASK_ROOT = os.path.join(DATA_ROOT, "processed_valid_masks")
 PREPROCESSED_IMAGE_ROOT = os.path.join(DATA_ROOT, "processed_train_images")
 PREPROCESSED_MASK_ROOT = os.path.join(DATA_ROOT, "processed_train_masks")
 CHECKPOINT_PATH = r"/mnt/researchdrive/ptiwari9/Staff_Trainee_Folders/Dan/chestCT/weights/fvlm_weights/model.pth"
 RADGENOME_CSV = os.path.join(DATA_ROOT, "radgenome_files", "train_region_report.csv")
-DEFAULT_OUTPUT_DIR = os.path.join(os.path.dirname(CHECKPOINT_PATH), "finetuned")
+# Where finetune.py actually writes checkpoints (main() reads this same output_dir key
+# out of finetune.yaml at run time - see main()/args.output_dir). Read straight from the
+# yaml instead of duplicating the path as a second hardcoded constant here, which is
+# exactly what let this drift out of sync with the yaml before (eval_finetune.py/
+# KE_prepare's *.py import DEFAULT_OUTPUT_DIR to find checkpoints, so a stale copy here
+# silently pointed them at an old run's directory). Only tracks the default
+# --cfg-path=finetune.yaml; a run launched with a different --cfg-path writes wherever
+# that file's own output_dir says, independent of this constant.
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "finetune.yaml")) as _f:
+    DEFAULT_OUTPUT_DIR = yaml.safe_load(_f)["output_dir"]
 
 ORGANS = [
     "abdomen", "bone", "breast", "esophagus", "heart",
-    "lung", "mediastinum", "thyroid", "trachea and bronchie"
+    "lung", "mediastinum", "thyroid", "trachea and bronchie", "pleura"
 ]
+
+# On-disk single-channel mask (preprocess.py::merge_organ_masks, id =
+# MASK_SOURCE_ORGANS.index(organ) + 1) only encodes these 9 - pleura's raw mask is
+# identical to lung's, so it never got its own id there.
+MASK_SOURCE_ORGANS = [o for o in ORGANS if o != "pleura"]
+
+# organ -> which seg value to look for. Same as MASK_SOURCE_ORGANS.index(organ) + 1 for
+# everyone except "pleura", which reads lung's value instead of getting its own.
+ORGAN_MASK_ID = {
+    organ: MASK_SOURCE_ORGANS.index("lung" if organ == "pleura" else organ) + 1
+    for organ in ORGANS
+}
 
 # Organs whose query_tokens row and vision_proj come from the pretrained checkpoint and
 # stay frozen. The checkpoint's 4th organ, aorta, has no standalone mask here (its
@@ -83,6 +107,9 @@ def count_intact_organs(seg, organs):
     mask is present AND doesn't touch the crop's boundary (RandSpatialCropd can
     slice through the middle of an organ; a half-organ isn't a usable "case").
 
+    Looks each organ's presence up by ORGAN_MASK_ID (not by position - "pleura" and
+    "lung" share the same seg value) rather than assuming seg value == index + 1.
+
     Returns a (batch_size, len(organs)) bool tensor.
     """
     flags = torch.zeros(len(seg), len(organs), dtype=torch.bool, device=seg.device)
@@ -93,16 +120,12 @@ def count_intact_organs(seg, organs):
             pul_seg[:, :, 0], pul_seg[:, :, -1],
         ]
         non_zero_boundaries = [b[b != 0].flatten() for b in boundaries]
-        boundary_values = torch.cat(non_zero_boundaries)
-        boundary_organs = torch.unique(boundary_values)
+        boundary_ids = set(torch.unique(torch.cat(non_zero_boundaries)).tolist())
+        present_ids = set(torch.unique(pul_seg).tolist()) - {0}
+        intact_ids = present_ids - boundary_ids
 
-        organ_ids = torch.unique(pul_seg)
-        organ_ids = organ_ids[organ_ids > 0]
-        intact_organ_ids = torch.tensor(
-            [oid.item() for oid in organ_ids if oid not in boundary_organs], dtype=torch.long
-        )
-        if len(intact_organ_ids):
-            flags[i][intact_organ_ids - 1] = True
+        for organ_idx, organ in enumerate(organs):
+            flags[i, organ_idx] = ORGAN_MASK_ID[organ] in intact_ids
     return flags
 
 
@@ -353,10 +376,10 @@ def build_pretrained_model(checkpoint_path):
     return model
 
 
-def expand_organs(model, new_organs, frozen_organs):
+def expand_organs(model, new_organs, frozen_organs, organ_mask_ids=None):
     """
     !!!froze MLP layer
-    
+
     Swap model.organs (currently the checkpoint's original 4) for new_organs.
     Any organ present in both the old list and frozen_organs keeps its pretrained
     query_tokens row and vision_proj, frozen; every other organ gets a freshly
@@ -368,6 +391,13 @@ def expand_organs(model, new_organs, frozen_organs):
     (see build_model/build_optimizer) - done there rather than here so the hook
     attaches after model.to(device), since Module._apply can swap in a brand-new
     Parameter object during .to() and silently drop a hook registered beforehand.
+
+    organ_mask_ids: optional {organ_name: seg_value} dict (see ORGAN_MASK_ID), stored on
+    the model as model.organ_mask_ids (list aligned with model.organs) for
+    BlipPretrain.forward() to read each organ's mask by value instead of by position -
+    needed because "pleura" and "lung" share the same seg value. Defaults to the plain
+    index+1 scheme (no aliasing) for callers that don't pass it (forward_test_win() never
+    consults model.organ_mask_ids, so eval-only callers can leave this out).
     """
     # Step 1:先把旧的东西(4 个器官的名字、query_tokens、vision_projs)存起来,
     # 马上就要被覆盖掉了,后面复制权重的时候还要用。
@@ -380,6 +410,10 @@ def expand_organs(model, new_organs, frozen_organs):
     # Step 2:换成新的、10 个器官的形状——query_tokens 先全部清零,vision_projs
     # 全部随机初始化(nn.Linear 默认初始化),后面再挑几个器官把权重覆盖回去。
     model.organs = list(new_organs)
+    model.organ_mask_ids = (
+        [i + 1 for i in range(len(new_organs))] if organ_mask_ids is None
+        else [organ_mask_ids[o] for o in new_organs]
+    )
     model.query_tokens = nn.Parameter(torch.zeros(len(new_organs), vision_width))
     model.vision_projs = nn.ModuleList([nn.Linear(vision_width, embed_dim) for _ in new_organs])
 
@@ -429,10 +463,10 @@ def freeze_shared_modules(model):
     model.attention.eval()
 
 
-def build_model(checkpoint_path, organs, frozen_organs, device):
+def build_model(checkpoint_path, organs, frozen_organs, device, organ_mask_ids=None):
     _apply_environment_patches()
     model = build_pretrained_model(checkpoint_path)
-    frozen_rows = expand_organs(model, organs, frozen_organs)
+    frozen_rows = expand_organs(model, organs, frozen_organs, organ_mask_ids)
     freeze_shared_modules(model)
 
     model = model.to(device)
@@ -550,7 +584,7 @@ def main():
         drop_last=True, num_workers=args.num_workers, collate_fn=collate_fn,
     )
 
-    model = build_model(args.checkpoint, ORGANS, FROZEN_ORGANS, device)
+    model = build_model(args.checkpoint, ORGANS, FROZEN_ORGANS, device, ORGAN_MASK_ID)
     model.train()
     model.visual_encoder.eval()
     model.text_encoder.eval()
